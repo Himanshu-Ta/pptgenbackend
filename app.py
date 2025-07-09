@@ -4,9 +4,9 @@ import os
 import re
 import json
 import asyncio
-import hashlib # For creating unique filenames for the cache
+import hashlib
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse # Modified imports
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple
@@ -16,26 +16,30 @@ import cv2
 import easyocr
 import httpx
 import numpy as np
+from PIL import Image # --- REQUIRED: Used for accurate image dimension reading ---
 
 # --- Presentation Imports ---
 from pptx import Presentation
+from pptx.chart.data import BubbleChartData
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
 from pptx.util import Inches, Pt
-from pptx.enum.shapes import MSO_SHAPE
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.enum.shapes import MSO_SHAPE
 
-# --- Initialize the EasyOCR Reader ---
-print("Initializing EasyOCR reader... (This may take a moment on first run)")
-# Explicitly telling easyocr to use the GPU if available.
+# --- Import data for the native chart from chart_data.py ---
+# Make sure you have a chart_data.py file in the same directory
+from chart_data import price_ladder_data, brand_colors, price_segments, brand_summary_data
+
+# --- Initialize OCR Reader ---
+print("Initializing EasyOCR reader...")
 ocr_reader = easyocr.Reader(["en"], gpu=True)
 print("EasyOCR reader initialized.")
 
-
-# --- API Credentials for Cohere AI ---
+# --- API Credentials ---
 COHERE_API_KEY = "xDfWr7AoPOT2w2vgAwI62UPHJhDIRcLgsLMfXzqf"
 
-
-# --- Pydantic Models for Request Data Validation ---
+# --- Pydantic Models ---
 class Report(BaseModel):
     id: str
     label: str
@@ -44,57 +48,43 @@ class Report(BaseModel):
     master: str
     title: str
 
-
 class GenerationRequest(BaseModel):
     selectedReports: List[Report]
     imageDataUrls: Dict[str, str]
 
-
 # --- FastAPI App Initialization ---
 app = FastAPI()
-
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
 # --- File-based Cache Setup ---
 CACHE_DIR = "ppt_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# --- Helper function to convert hex to RGB ---
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-# --- Core Processing Functions (Optimized with asyncio and in-memory handling) ---
-
+# --- Helper Functions for Chart Processing ---
 def extract_chart_details_from_memory(image_bytes: bytes) -> List[Dict[str, Any]]:
-    """(OPTIMIZED) Uses EasyOCR on an in-memory image."""
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
         img_np = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         ocr_results = ocr_reader.readtext(img_np, detail=0, paragraph=True)
         return [{"extracted_text": " ".join(ocr_results)}]
     except Exception as e:
-        print(f"Error during in-memory EasyOCR processing: {e}")
-        return [{"error": "Could not process chart image."}]
+        print(f"Error during EasyOCR processing: {e}")
+        return [{"error": "Could not process chart."}]
 
-async def get_summary_from_extracted_data(title: str, extracted_data: List[Dict[str, Any]]) -> str:
-    """Sends structured data to Cohere for a summary."""
-    if not COHERE_API_KEY:
-        return "▪ [Key insight placeholder - Cohere API key not configured]"
-    
-    data_string = json.dumps(extracted_data, indent=2)
-    prompt = f"""
-    You are a data analyst. Your task is to provide a single, brief summary sentence for a presentation slide.
-    The chart is titled: '{title}'. The extracted data is:
-    {data_string}
-    Based *only* on this data, what is the single most important takeaway?
-    State it as one concise sentence. Do not use bullet points or conversational language.
-    """
+async def get_summary_from_text(title: str, text_data: str) -> str:
+    """Generic function to get a summary from any text data."""
+    if not COHERE_API_KEY or COHERE_API_KEY == "your_cohere_api_key_here":
+        return "▪ [Cohere API key not configured]"
+    prompt = f"Provide a single, brief summary sentence for a presentation slide. The chart is titled: '{title}'. The extracted data is: {text_data}"
     headers = {"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": "command-r-plus", "message": prompt}
-    
     try:
         async with httpx.AsyncClient(verify=False) as client:
             response = await client.post("https://api.cohere.com/v1/chat", json=payload, headers=headers, timeout=60)
@@ -106,28 +96,27 @@ async def get_summary_from_extracted_data(title: str, extracted_data: List[Dict[
         print(f"Error communicating with Cohere API: {e}")
         return "▪ [Error: Could not retrieve AI summary.]"
 
-async def process_report_concurrently(report: Report, image_data_url: str) -> Tuple[Report, bytes, str]:
-    """Orchestrates all processing for a single report to enable concurrency."""
+async def process_screenshot_report(report: Report, image_data_url: str) -> Dict[str, Any]:
     header, encoded = image_data_url.split(",", 1)
     image_bytes = base64.b64decode(encoded)
-    
     loop = asyncio.get_running_loop()
-    # Run the heavy OCR task in a separate thread to avoid blocking the server
     extracted_details = await loop.run_in_executor(None, extract_chart_details_from_memory, image_bytes)
-    
-    summary_text = await get_summary_from_extracted_data(report.title, extracted_details)
-    return report, image_bytes, summary_text
+    summary_text = await get_summary_from_text(report.title, json.dumps(extracted_details))
+    return {"id": report.id, "report": report, "image_bytes": image_bytes, "summary": summary_text}
+
+async def get_summary_for_native_chart(report: Report) -> str:
+    """Generates a summary for the native bubble chart."""
+    description = f"A bubble chart showing the price ladder for various brands. Brands include {', '.join([s['series_name'] for s in price_ladder_data])}."
+    return await get_summary_from_text(report.title, description)
 
 
-# --- Presentation Building Functions (Unchanged) ---
-
+# --- Slide Creation Functions ---
 def add_custom_header(slide, active_tab_text):
     tabs = ["Market Projections", "Category Overview", "Consumer Overview", "A&P Overview"]
     background_bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, Inches(13.33), Inches(0.75))
     background_bar.fill.solid()
     background_bar.fill.fore_color.rgb = RGBColor(0xF1, 0xF1, 0xF1)
     background_bar.line.fill.background()
-    
     for i, tab_text in enumerate(tabs):
         is_active = (tab_text == active_tab_text)
         color = RGBColor(0xF5, 0x82, 0x20) if is_active else RGBColor(0x6E, 0x6E, 0x6E)
@@ -136,18 +125,20 @@ def add_custom_header(slide, active_tab_text):
         chevron.fill.solid()
         chevron.fill.fore_color.rgb = color
         chevron.line.fill.background()
-        
         text_box = slide.shapes.add_textbox(left_pos, Inches(0.15), Inches(2.0), Inches(0.45))
         p = text_box.text_frame.paragraphs[0]
         p.text = tab_text
-        p.font.name = "Arial"; p.font.color.rgb = RGBColor(255, 255, 255); p.font.size = Pt(10); p.alignment = PP_ALIGN.CENTER; text_box.text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+        p.font.name = "Arial"
+        p.font.color.rgb = RGBColor(255, 255, 255)
+        p.font.size = Pt(10)
+        p.alignment = PP_ALIGN.CENTER
+        text_box.text_frame.vertical_anchor = MSO_ANCHOR.MIDDLE
         if is_active:
             p.font.bold = True
-            
     try:
         slide.shapes.add_picture("assets/imperial-logo.png", Inches(11.5), Inches(0.1), width=Inches(1.5))
     except FileNotFoundError:
-        print("Warning: 'imperial-logo.png' not found in 'assets' folder.")
+        pass
 
 def add_title_slide(pres):
     slide_layout = pres.slide_layouts[6]
@@ -161,11 +152,16 @@ def add_title_slide(pres):
         title_box = slide.shapes.add_textbox(Inches(0.6), Inches(5.8), Inches(10), Inches(0.5))
         p_title = title_box.text_frame.paragraphs[0]
         p_title.text = "PORTFOLIO STRATEGY WORKSHOP"
-        p_title.font.name = "Arial"; p_title.font.bold = True; p_title.font.size = Pt(24); p_title.font.color.rgb = RGBColor(0xF5, 0x82, 0x20)
+        p_title.font.name = "Arial"
+        p_title.font.bold = True
+        p_title.font.size = Pt(24)
+        p_title.font.color.rgb = RGBColor(0xF5, 0x82, 0x20)
         preread_box = slide.shapes.add_textbox(Inches(0.6), Inches(6.2), Inches(10), Inches(0.5))
         p_preread = preread_box.text_frame.paragraphs[0]
         p_preread.text = "Pre-read"
-        p_preread.font.name = "Arial"; p_preread.font.size = Pt(18); p_preread.font.color.rgb = RGBColor(0x6E, 0x6E, 0x6E)
+        p_preread.font.name = "Arial"
+        p_preread.font.size = Pt(18)
+        p_preread.font.color.rgb = RGBColor(0x6E, 0x6E, 0x6E)
         slide.shapes.add_picture("assets/imperial-logo.png", Inches(11.5), Inches(5.8), width=Inches(1.5))
     except FileNotFoundError:
         pass
@@ -180,38 +176,117 @@ def add_contents_slide(pres, selected_reports):
     title_box = slide.shapes.add_textbox(Inches(0.6), Inches(1.8), Inches(10), Inches(0.5))
     p_title = title_box.text_frame.paragraphs[0]
     p_title.text = "Contents"
-    p_title.font.name = "Arial"; p_title.font.size = Pt(20); p_title.font.color.rgb = RGBColor(0x6E, 0x6E, 0x6E)
+    p_title.font.name = "Arial"
+    p_title.font.size = Pt(20)
+    p_title.font.color.rgb = RGBColor(0x6E, 0x6E, 0x6E)
     y_pos = Inches(2.8)
     for i, report in enumerate(selected_reports):
         num_p = slide.shapes.add_textbox(Inches(1.0), y_pos, Inches(0.5), Inches(0.5)).text_frame.paragraphs[0]
         num_p.text = f"{i + 1}."
-        num_p.font.name = "Arial"; num_p.font.size = Pt(18); num_p.font.color.rgb = RGBColor(0xA9, 0xA9, 0xA9)
+        num_p.font.name = "Arial"
+        num_p.font.size = Pt(18)
+        num_p.font.color.rgb = RGBColor(0xA9, 0xA9, 0xA9)
         text_p = slide.shapes.add_textbox(Inches(1.5), y_pos, Inches(10), Inches(0.5)).text_frame.paragraphs[0]
         text_p.text = report.label
-        text_p.font.name = "Arial"; text_p.font.size = Pt(18); text_p.font.color.rgb = RGBColor(0x6E, 0x6E, 0x6E)
+        text_p.font.name = "Arial"
+        text_p.font.size = Pt(18)
+        text_p.font.color.rgb = RGBColor(0x6E, 0x6E, 0x6E)
         y_pos += Inches(0.6)
 
-def add_chart_slide(pres, report_data: Report, image_bytes: bytes, summary_text: str):
+def add_chart_slide_from_image(pres, report_data: Report, image_bytes: bytes, summary_text: str):
     slide_layout = pres.slide_layouts[6]
     slide = pres.slides.add_slide(slide_layout)
     add_custom_header(slide, report_data.tab)
+    
     title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(12.3), Inches(0.5))
     p_title = title_box.text_frame.paragraphs[0]
     p_title.text = report_data.title
-    p_title.font.name = "Arial"; p_title.font.bold = True; p_title.font.size = Pt(22); p_title.font.color.rgb = RGBColor(0xF5, 0x82, 0x20)
-    chart_left, chart_top, chart_width, chart_height = Inches(0.5), Inches(1.6), Inches(8.5), Inches(5.5)
-    insights_left = chart_left + chart_width + Inches(0.3)
+    p_title.font.name = "Arial"
+    p_title.font.bold = True
+    p_title.font.size = Pt(22)
+    p_title.font.color.rgb = RGBColor(0xF5, 0x82, 0x20)
+    
+    # --- FIX APPLIED HERE: More robust image scaling and positioning ---
+    
+    # Define the bounding box for the chart image
+    box_left = Inches(0.5)
+    box_top = Inches(1.6)
+    box_width = Inches(8.5)
+    box_height = Inches(5.5)
+    
+    # Get actual image dimensions using Pillow
     image_stream = io.BytesIO(image_bytes)
-    pic = slide.shapes.add_picture(image_stream, chart_left, chart_top, width=chart_width)
-    img_ratio = pic.width / pic.height
-    box_ratio = chart_width / chart_height
+    try:
+        with Image.open(image_stream) as img:
+            img_width, img_height = img.size
+    except Exception as e:
+        print(f"Could not read image dimensions with Pillow: {e}")
+        # Fallback to a default size if image is unreadable
+        img_width, img_height = box_width, box_height
+
+    # Calculate aspect ratios
+    img_ratio = float(img_width) / float(img_height) if img_height > 0 else 1.0
+    box_ratio = float(box_width) / float(box_height)
+
+    # Determine the final size of the image on the slide to fit the box
     if img_ratio > box_ratio:
-        pic.height = int(pic.width / img_ratio)
+        # Image is wider than the box, scale by width
+        final_width = box_width
+        final_height = final_width / img_ratio
     else:
-        pic.width = int(pic.height * img_ratio)
-    pic.left = int(chart_left + (chart_width - pic.width) / 2)
-    pic.top = int(chart_top + (chart_height - pic.height) / 2)
-    insights_box = slide.shapes.add_textbox(insights_left, chart_top, Inches(3.5), chart_height)
+        # Image is taller than the box, scale by height
+        final_height = box_height
+        final_width = final_height * img_ratio
+
+    # Calculate position to center the image within the bounding box
+    final_left = box_left + (box_width - final_width) / 2
+    final_top = box_top + (box_height - final_height) / 2
+
+    # Add the picture with the calculated size and position
+    image_stream.seek(0) # Reset stream for pptx
+    slide.shapes.add_picture(image_stream, final_left, final_top, width=final_width, height=final_height)
+    
+    # Position the insights box relative to the bounding box
+    insights_left = box_left + box_width + Inches(0.3)
+    insights_box = slide.shapes.add_textbox(insights_left, box_top, Inches(3.5), box_height)
+    insights_frame = insights_box.text_frame
+    insights_frame.word_wrap = True
+    p_heading = insights_frame.paragraphs[0]
+    p_heading.text = "Key Insight"
+    p_heading.font.name = 'Arial'
+    p_heading.font.bold = True
+    p_heading.font.size = Pt(16)
+    p_heading.font.color.rgb = RGBColor(0x40, 0x40, 0x40)
+    p_summary = insights_frame.add_paragraph()
+    p_summary.text = f"▪ {summary_text}"
+    p_summary.font.name = 'Arial'
+    p_summary.font.size = Pt(12)
+    p_summary.line_spacing = 1.5
+
+def add_live_bubble_chart_slide(pres, report_data: Report, summary_text: str):
+    slide_layout = pres.slide_layouts[6]
+    slide = pres.slides.add_slide(slide_layout)
+    add_custom_header(slide, report_data.tab)
+    
+    title_shape = slide.shapes.add_textbox(Inches(0.5), Inches(0.9), Inches(12.3), Inches(0.5))
+    p_title = title_shape.text_frame.paragraphs[0]
+    p_title.text = report_data.title
+    p_title.font.name = "Arial"
+    p_title.font.bold = True
+    p_title.font.size = Pt(22)
+    p_title.font.color.rgb = RGBColor(0xF5, 0x82, 0x20)
+    
+    # --- FIX APPLIED HERE: Consistent Layout Definition ---
+    
+    # Define layout areas consistent with the image-based slides
+    box_left = Inches(0.5)
+    box_top = Inches(1.6)
+    box_width = Inches(8.5)
+    box_height = Inches(5.5)
+    
+    # Position the insights box to the right
+    insights_left = box_left + box_width + Inches(0.3)
+    insights_box = slide.shapes.add_textbox(insights_left, box_top, Inches(3.5), box_height)
     insights_frame = insights_box.text_frame
     insights_frame.word_wrap = True
     p_heading = insights_frame.paragraphs[0]
@@ -221,70 +296,100 @@ def add_chart_slide(pres, report_data: Report, image_bytes: bytes, summary_text:
     p_summary.text = f"▪ {summary_text}"
     p_summary.font.name = 'Arial'; p_summary.font.size = Pt(12); p_summary.line_spacing = 1.5
 
+    # --- Chart Creation and Positioning ---
+    # Position the chart and its elements within the defined chart_area
+    chart_x = Inches(2.0) # Start chart a bit to the right to make space for labels
+    chart_y = box_top
+    chart_cx = Inches(6.8) # Adjust width to fit in the area
+    chart_cy = Inches(4.0)
+    table_y = chart_y + chart_cy + Inches(0.2)
+    
+    chart_data = BubbleChartData()
+    for series_data in price_ladder_data:
+        series = chart_data.add_series(series_data["series_name"])
+        for point in series_data["points"]:
+            series.add_data_point(point[0], point[1], point[2])
+            
+    graphic_frame = slide.shapes.add_chart(XL_CHART_TYPE.BUBBLE, chart_x, chart_y, chart_cx, chart_cy, chart_data)
+    chart = graphic_frame.chart
+    chart.has_legend = False
+    
+    value_axis = chart.value_axis
+    value_axis.has_title = True; value_axis.axis_title.text_frame.text = "WAP (per 20 stick pack)"; value_axis.minimum_scale = 0.0; value_axis.maximum_scale = 7.0; value_axis.major_unit = 1.0; value_axis.has_major_gridlines = True; value_axis.major_gridlines.format.line.dash_style = 3
+    
+    category_axis = chart.category_axis
+    category_axis.has_major_gridlines = False; category_axis.has_minor_gridlines = False
+    
+    for i, series in enumerate(chart.series):
+        series.format.fill.solid()
+        series.format.fill.fore_color.rgb = RGBColor(*hex_to_rgb(brand_colors[i]))
 
-# --- API Endpoint with File-based Caching ---
+    for seg in price_segments:
+        textbox = slide.shapes.add_textbox(box_left, chart_y + chart_cy * (1 - (seg['y'] / 7.0)) - Inches(0.2), Inches(1.5), Inches(0.4))
+        p = textbox.text_frame.paragraphs[0]; p.text = seg['name']; p.font.size = Pt(8); p.alignment = PP_ALIGN.RIGHT
+
+    rows, cols = 4, len(brand_summary_data) + 1
+    table_shape = slide.shapes.add_table(rows, cols, box_left, table_y, box_width, Inches(1.0)); table = table_shape.table
+    table.cell(0, 0).text = "Brand"; table.cell(1, 0).text = "MS%"; table.cell(2, 0).text = "# SKUS"; table.cell(3, 0).text = "Avg. SKU MS%"
+    for i, brand_data in enumerate(brand_summary_data):
+        col_idx = i + 1; table.cell(0, col_idx).text = brand_data['brand']; table.cell(1, col_idx).text = brand_data['ms']; table.cell(2, col_idx).text = str(brand_data['skus']); table.cell(3, col_idx).text = brand_data['avgMs']
+
+# --- Main API Endpoint with Hybrid Logic ---
 @app.post("/generate-ppt")
 async def generate_ppt_endpoint(request_data: GenerationRequest):
-    """
-    (FILE-CACHED & OPTIMIZED) Assembles the presentation.
-    Repeated requests for the same reports will be served instantly from the file cache.
-    """
-    # 1. Create a unique key for the request
     report_ids = sorted([report.id for report in request_data.selectedReports])
     key_string = ":".join(report_ids)
     hashed_key = hashlib.sha256(key_string.encode()).hexdigest()
-    cache_filename = f"{hashed_key}.pptx"
-    cache_filepath = os.path.join(CACHE_DIR, cache_filename)
+    cache_filepath = os.path.join(CACHE_DIR, f"{hashed_key}.pptx")
 
-    # 2. Check if the file exists in the cache
     if os.path.exists(cache_filepath):
         print(f"CACHE HIT: Serving report from file: {cache_filepath}")
-        return FileResponse(
-            path=cache_filepath,
-            media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            filename='AI_Generated_Report.pptx'
-        )
+        return FileResponse(path=cache_filepath, media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation', filename='AI_Generated_Report.pptx')
 
-    # 3. If not cached, generate the report (Cache Miss)
     print(f"CACHE MISS: Generating new report for key: {hashed_key}")
     
-    os.makedirs("assets", exist_ok=True)
+    screenshot_tasks = []
+    native_chart_tasks = {}
+
+    for r in request_data.selectedReports:
+        if r.id == 'priceladder':
+            native_chart_tasks[r.id] = asyncio.create_task(get_summary_for_native_chart(r))
+        else:
+            image_url = request_data.imageDataUrls.get(r.id)
+            if image_url:
+                screenshot_tasks.append(process_screenshot_report(r, image_url))
     
+    processed_screenshots = await asyncio.gather(*screenshot_tasks)
+    processed_map = {item['id']: item for item in processed_screenshots}
+    
+    native_chart_summaries = {task_id: await task for task_id, task in native_chart_tasks.items()}
+
     pres = Presentation()
     pres.slide_width = Inches(13.33)
     pres.slide_height = Inches(7.5)
-
     add_title_slide(pres)
     add_contents_slide(pres, request_data.selectedReports)
 
-    # Concurrently process all slides
-    tasks = []
     for report in request_data.selectedReports:
-        image_data_url = request_data.imageDataUrls.get(report.id)
-        if image_data_url:
-            tasks.append(process_report_concurrently(report, image_data_url))
+        if report.id == 'priceladder':
+            summary = native_chart_summaries.get(report.id, "Insight could not be generated.")
+            add_live_bubble_chart_slide(pres, report, summary)
+        elif report.id in processed_map:
+            processed_data = processed_map[report.id]
+            add_chart_slide_from_image(pres, processed_data['report'], processed_data['image_bytes'], processed_data['summary'])
 
-    try:
-        processed_results = await asyncio.gather(*tasks)
-        for report_data, image_bytes, summary_text in processed_results:
-            add_chart_slide(pres, report_data, image_bytes, summary_text)
-    except Exception as e:
-        print(f"An error occurred during concurrent processing: {e}")
-    
     ppt_buffer = io.BytesIO()
     pres.save(ppt_buffer)
     ppt_buffer.seek(0)
-
-    # 4. Save the newly generated report to the cache folder
+    
     with open(cache_filepath, "wb") as f:
         f.write(ppt_buffer.getvalue())
     print(f"SAVED TO CACHE: {cache_filepath}")
 
-    # Return the generated report to the user
     return StreamingResponse(
         iter([ppt_buffer.getvalue()]),
         media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        headers={'Content-Disposition': 'attachment; filename=AI_Generated_Report.pptx'}
+        headers={'Content-Disposition': 'attachment; filename=Hybrid_Report.pptx'}
     )
 
 
