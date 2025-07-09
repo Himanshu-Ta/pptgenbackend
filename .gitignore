@@ -1,2 +1,6 @@
-*/env
-/_pycache_
+env/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.pptx
